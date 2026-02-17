@@ -1,1 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Vendor Dashboard</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        body { margin: 0; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; }
+        #map { flex: 1; }
+        #dashboard { height: 40%; background: #fff; padding: 20px; overflow-y: scroll; border-top: 2px solid #ccc; }
+        .order-card { background: #f9f9f9; padding: 15px; margin-bottom: 10px; border-left: 5px solid orange; border-radius: 5px; }
+        .btn-accept { background: green; color: white; padding: 8px 15px; border: none; border-radius: 4px; cursor: pointer; }
+        .status-toggle { margin-bottom: 10px; }
+    </style>
+</head>
+<body>
 
+    <div id="map"></div>
+
+    <div id="dashboard">
+        <div class="status-toggle">
+            <h3>Vendor Dashboard</h3>
+            <label>You are Online: <input type="checkbox" checked id="status-switch"></label>
+        </div>
+        <div id="order-list">
+            <p>Waiting for orders...</p>
+        </div>
+    </div>
+
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script>
+        // Generate a random Vendor ID for this session
+        const vendorId = "v" + Math.floor(Math.random() * 1000);
+        
+        // 1. Initialize Map
+        const map = L.map('map').setView([26.2183, 78.1828], 14);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+
+        // 2. Realtime Location Broadcast
+        const ws = new WebSocket(`ws://localhost:8000/ws/vendor/${vendorId}`);
+        let myMarker = null;
+
+        // Function to send location to server
+        function broadcastLocation(lat, lng) {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: "location_update",
+                    icon: "food", // Vendor can change this to 'veg'
+                    location: {lat: lat, lng: lng}
+                }));
+            }
+        }
+
+        // Watch GPS Position
+        navigator.geolocation.watchPosition((pos) => {
+            const lat = pos.coords.latitude;
+            const lng = pos.coords.longitude;
+
+            // Move my own marker
+            if (myMarker) myMarker.setLatLng([lat, lng]);
+            else myMarker = L.marker([lat, lng]).addTo(map).bindPopup("You").openPopup();
+
+            map.setView([lat, lng]); // Center map on me
+            broadcastLocation(lat, lng);
+        }, (err) => console.error(err), { enableHighAccuracy: true });
+
+        // 3. Receive Orders
+        ws.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            if (data.type === "new_order") {
+                // Check if order is for me (In MVP we broadcast to all, so we filter here)
+                if (data.order.vendor_id === vendorId) {
+                    showNewOrder(data.order);
+                }
+            }
+        };
+
+        function showNewOrder(order) {
+            const list = document.getElementById('order-list');
+            // Remove "waiting" text if exists
+            if (list.innerHTML.includes("Waiting")) list.innerHTML = "";
+
+            const div = document.createElement('div');
+            div.className = "order-card";
+            div.innerHTML = `
+                <h4>New Order! ₹${order.total}</h4>
+                <p>Customer is 2 mins away.</p>
+                <button class="btn-accept" onclick="acceptOrder('${order._id}', ${order.user_location.lat}, ${order.user_location.lng})">Accept & Navigate</button>
+            `;
+            list.prepend(div);
+        }
+
+        // 4. Accept & Route
+        function acceptOrder(oid, uLat, uLng) {
+            // Draw line to customer (Simple straight line for MVP)
+            const myPos = myMarker.getLatLng();
+            const routeLine = L.polyline([myPos, [uLat, uLng]], {color: 'blue', weight: 4}).addTo(map);
+            map.fitBounds(routeLine.getBounds());
+
+            // Add pin for customer
+            L.marker([uLat, uLng]).addTo(map).bindPopup("Customer Location").openPopup();
+
+            alert("Order Accepted! Route displayed.");
+            
+            // Notify Backend
+            fetch(`http://localhost:8000/api/order/${oid}/status?status=accepted`, {method: 'POST'});
+        }
+
+        // Initialize Vendor Profile on Load
+        fetch("http://localhost:8000/api/vendor/init", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                id: vendorId, name: "Raju Chaat", icon_type: "food",
+                location: {lat: 0, lng: 0}, menu: []
+            })
+        });
+
+    </script>
+</body>
+</html>
