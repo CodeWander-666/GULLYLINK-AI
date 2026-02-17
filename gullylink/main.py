@@ -1,140 +1,119 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel
-from typing import List, Dict
-import json
 import asyncio
+import random
+from typing import List, Dict
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 app = FastAPI()
 
-# --- CONFIGURATION ---
-# 1. Database Setup (MongoDB)
-# Replace with your actual MongoDB URI if hosting remotely. 
-# For local, ensure MongoDB is running or use a cloud string.
-MONGO_URI = "mongodb://localhost:27017" 
-client = AsyncIOMotorClient(MONGO_URI)
-db = client.gullylink
-vendors_collection = db.vendors
-orders_collection = db.orders
+# Mount frontend directory for static files if needed, here we use templates
+templates = Jinja2Templates(directory="frontend")
 
-# 2. CORS (Allow Frontend to talk to Backend)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # In production, specify your Vercel URL
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# --- In-Memory Database (Base Model) ---
+# 5 Dummy Vendors for Diagnosis
+VENDORS = {
+    "v1": {"id": "v1", "name": "Chai Point", "lat": 28.6139, "lng": 77.2090, "icon": "☕", "category": "Beverages", "orders": []},
+    "v2": {"id": "v2", "name": "Burger Singh", "lat": 28.6129, "lng": 77.2100, "icon": "🍔", "category": "Fast Food", "orders": []},
+    "v3": {"id": "v3", "name": "Sharma Sweets", "lat": 28.6145, "lng": 77.2080, "icon": "🍬", "category": "Sweets", "orders": []},
+    "v4": {"id": "v4", "name": "Pizza Hut Mobile", "lat": 28.6150, "lng": 77.2110, "icon": "🍕", "category": "Italian", "orders": []},
+    "v5": {"id": "v5", "name": "Gully Momos", "lat": 28.6110, "lng": 77.2070, "icon": "🥟", "category": "Street Food", "orders": []},
+}
 
-# --- REALTIME WEBSOCKET MANAGER ---
+# Dummy Menu (Zomato Style)
+MENU = {
+    "v1": [{"item": "Masala Chai", "price": 20}, {"item": "Bun Maska", "price": 40}],
+    "v2": [{"item": "Veggie Burger", "price": 80}, {"item": "Fries", "price": 60}],
+    "v3": [{"item": "Rasgulla", "price": 30}, {"item": "Samosa", "price": 15}],
+    "v4": [{"item": "Margherita Pizza", "price": 150}, {"item": "Garlic Bread", "price": 90}],
+    "v5": [{"item": "Steamed Momos", "price": 50}, {"item": "Fried Momos", "price": 60}],
+}
+
+# --- Connection Manager for Realtime ---
 class ConnectionManager:
     def __init__(self):
-        # Store active connections: 'user' or 'vendor'
-        self.active_connections: Dict[str, List[WebSocket]] = {"user": [], "vendor": []}
+        self.active_connections: List[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket, role: str):
+    async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[role].append(websocket)
+        self.active_connections.append(websocket)
 
-    def disconnect(self, websocket: WebSocket, role: str):
-        if websocket in self.active_connections[role]:
-            self.active_connections[role].remove(websocket)
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
 
-    # Send message to all Users (e.g., Vendor moved)
-    async def broadcast_to_users(self, message: dict):
-        for connection in self.active_connections["user"]:
-            await connection.send_json(message)
-
-    # Send message to a specific Vendor (e.g., New Order)
-    # For MVP simplicity, we broadcast to all vendors, client side filters by ID
-    async def broadcast_to_vendors(self, message: dict):
-        for connection in self.active_connections["vendor"]:
+    async def broadcast(self, message: dict):
+        for connection in self.active_connections:
             await connection.send_json(message)
 
 manager = ConnectionManager()
 
-# --- DATA MODELS ---
-class VendorProfile(BaseModel):
-    id: str
-    name: str
-    icon_type: str  # e.g., "burger", "coffee", "veg"
-    location: dict  # {lat: float, lng: float}
-    menu: List[dict] # [{name: "Poha", price: 20}]
-
+# --- Models ---
 class Order(BaseModel):
     vendor_id: str
-    user_location: dict
-    items: List[dict]
-    total: float
-    status: str = "pending" # pending, accepted, rejected
+    item: str
+    customer_lat: float
+    customer_lng: float
 
-# --- API ROUTES ---
+# --- Routes ---
 
 @app.get("/")
-async def root():
-    return {"message": "GullyLINK API is Running"}
+async def get_user_ui(request: Request):
+    return templates.TemplateResponse("user.html", {"request": request})
 
-# 1. Vendor Updates Location (Realtime)
-@app.websocket("/ws/vendor/{vendor_id}")
-async def vendor_websocket(websocket: WebSocket, vendor_id: str):
-    await manager.connect(websocket, "vendor")
+@app.get("/vendor")
+async def get_vendor_ui(request: Request):
+    return templates.TemplateResponse("vendor.html", {"request": request})
+
+@app.get("/api/vendors")
+async def get_vendors():
+    return VENDORS
+
+@app.get("/api/menu/{vendor_id}")
+async def get_menu(vendor_id: str):
+    return MENU.get(vendor_id, [])
+
+@app.post("/api/order")
+async def place_order(order: Order):
+    if order.vendor_id in VENDORS:
+        order_data = {
+            "id": random.randint(1000, 9999),
+            "item": order.item,
+            "status": "Pending",
+            "lat": order.customer_lat,
+            "lng": order.customer_lng
+        }
+        VENDORS[order.vendor_id]["orders"].append(order_data)
+        
+        # Realtime: Notify everyone (Vendor sees order, User sees status)
+        await manager.broadcast({
+            "type": "new_order",
+            "vendor_id": order.vendor_id,
+            "order": order_data
+        })
+        return {"status": "Order Placed", "order_id": order_data["id"]}
+    return {"status": "Vendor not found"}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await manager.connect(websocket)
     try:
         while True:
             data = await websocket.receive_json()
-            # Expecting: {lat: x, lng: y, type: "location_update"}
-            if data.get("type") == "location_update":
-                # Broadcast new location to ALL users immediately
-                await manager.broadcast_to_users({
-                    "type": "vendor_moved",
-                    "vendor_id": vendor_id,
-                    "location": data["location"],
-                    "icon": data.get("icon", "default")
-                })
+            # If Vendor updates location
+            if data['type'] == 'location_update':
+                vendor_id = data['id']
+                if vendor_id in VENDORS:
+                    VENDORS[vendor_id]['lat'] = data['lat']
+                    VENDORS[vendor_id]['lng'] = data['lng']
+                    # Broadcast new location to ALL users immediately
+                    await manager.broadcast(data)
+            
+            # If Vendor updates Order Status (Accept/Reject)
+            elif data['type'] == 'order_update':
+                await manager.broadcast(data)
+
     except WebSocketDisconnect:
-        manager.disconnect(websocket, "vendor")
+        manager.disconnect(websocket)
 
-# 2. User Listens for Vendors
-@app.websocket("/ws/user")
-async def user_websocket(websocket: WebSocket):
-    await manager.connect(websocket, "user")
-    try:
-        while True:
-            await websocket.receive_text() # Keep connection alive
-    except WebSocketDisconnect:
-        manager.disconnect(websocket, "user")
-
-# 3. Create Order (User -> Vendor)
-@app.post("/api/order")
-async def create_order(order: Order):
-    new_order = order.dict()
-    # Save to DB
-    result = await orders_collection.insert_one(new_order)
-    new_order["_id"] = str(result.inserted_id)
-    
-    # Alert the Vendor Realtime
-    await manager.broadcast_to_vendors({
-        "type": "new_order",
-        "order": new_order
-    })
-    return {"status": "Order Placed", "order_id": str(result.inserted_id)}
-
-# 4. Vendor Respond to Order (Accept/Reject)
-@app.post("/api/order/{order_id}/status")
-async def update_order_status(order_id: str, status: str):
-    # Update DB
-    await orders_collection.update_one({"_id": order_id}, {"$set": {"status": status}})
-    return {"status": "updated"}
-
-# 5. Initialize Vendor (Mock Data for MVP)
-@app.post("/api/vendor/init")
-async def init_vendor(vendor: VendorProfile):
-    # Upsert vendor in DB
-    await vendors_collection.update_one(
-        {"id": vendor.id}, 
-        {"$set": vendor.dict()}, 
-        upsert=True
-    )
-    return {"msg": "Vendor Online"}
-
-# Run with: uvicorn main:app --reload
+# Start with: uvicorn main:app --reload
